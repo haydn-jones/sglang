@@ -98,7 +98,7 @@ class DotsOCRProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
 
-    image_processor_class = "Qwen2VLImageProcessor"
+    image_processor_class = "Qwen2VLImageProcessorFast"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
 
     def __init__(
