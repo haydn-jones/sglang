@@ -11,6 +11,7 @@ from sglang.srt.configs.step3_vl import (
     Step3VisionEncoderConfig,
     Step3VLConfig,
 )
+from sglang.srt.configs.dots_ocr import DotsOCRConfig
 
 __all__ = [
     "ExaoneConfig",
@@ -24,4 +25,5 @@ __all__ = [
     "Step3VLConfig",
     "Step3TextConfig",
     "Step3VisionEncoderConfig",
+    "DotsOCRConfig",
 ]

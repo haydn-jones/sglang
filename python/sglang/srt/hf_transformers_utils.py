@@ -43,6 +43,7 @@ from sglang.srt.configs import (
     LongcatFlashConfig,
     MultiModalityConfig,
     Step3VLConfig,
+    DotsOCRConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -58,6 +59,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     InternVLChatConfig.model_type: InternVLChatConfig,
     Step3VLConfig.model_type: Step3VLConfig,
     LongcatFlashConfig.model_type: LongcatFlashConfig,
+    DotsOCRConfig.model_type: DotsOCRConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
