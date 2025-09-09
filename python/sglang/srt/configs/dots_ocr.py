@@ -1,17 +1,15 @@
-from typing import List, Optional, Union
-
 from transformers import (
     AutoProcessor,
     PretrainedConfig,
     ProcessorMixin,
 )
-
-# from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
-
-# from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import (
+    Qwen2VLImageProcessorFast,
+)
 from transformers.processing_utils import ProcessingKwargs, Unpack
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
@@ -21,8 +19,8 @@ class DotsOCRVisionConfig(PretrainedConfig):
 
     def __init__(
         self,
-        embed_dim: int = 1536,  # vision encoder embed size
-        hidden_size: int = 1536,  # after merger hidden size
+        embed_dim: int = 1536,
+        hidden_size: int = 1536,
         intermediate_size: int = 4224,
         num_hidden_layers: int = 42,
         num_attention_heads: int = 12,
@@ -32,12 +30,12 @@ class DotsOCRVisionConfig(PretrainedConfig):
         temporal_patch_size: int = 1,
         rms_norm_eps: float = 1e-5,
         use_bias: bool = False,
-        attn_implementation="flash_attention_2",  # "eager","sdpa","flash_attention_2"
-        initializer_range=0.02,
-        init_merger_std=0.02,
-        is_causal=False,  # ve causal forward
-        post_norm=True,
-        gradient_checkpointing=False,
+        attn_implementation: str = "flash_attention_2",
+        initializer_range: float = 0.02,
+        init_merger_std: float = 0.02,
+        is_causal: bool = False,
+        post_norm: bool = True,
+        gradient_checkpointing: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -75,10 +73,8 @@ class DotsOCRConfig(PretrainedConfig):
 
 class DotsOCRProcessorKwargs(ProcessingKwargs, total=False):
     _defaults = {
-        "text_kwargs": {
-            "padding": False,
-        },
-    }
+        "text_kwargs": {"padding": False},
+    }  # type: ignore
 
 
 class DotsOCRProcessor(ProcessorMixin):
@@ -101,86 +97,41 @@ class DotsOCRProcessor(ProcessorMixin):
     image_processor_class = "Qwen2VLImageProcessorFast"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
 
+    tokenizer: Qwen2TokenizerFast
+    image_processor: Qwen2VLImageProcessorFast
+
     def __init__(
-        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
+        self,
+        image_processor: Qwen2VLImageProcessorFast,
+        tokenizer: Qwen2TokenizerFast,
+        chat_template: str | None = None,
+        **kwargs,
     ):
-        self.image_token = (
-            "<|imgpad|>"
-            if not hasattr(tokenizer, "image_token")
-            else tokenizer.image_token
-        )
-        self.video_token = (
-            "<|video_pad|>"
-            if not hasattr(tokenizer, "video_token")
-            else tokenizer.video_token
-        )
-        self.img_token = (
-            "<|img|>" if not hasattr(tokenizer, "img_token") else tokenizer.img_token
-        )
-        self.endofimg_token = (
-            "<|endofimg|>"
-            if not hasattr(tokenizer, "endofimg_token")
-            else tokenizer.endofimg_token
-        )
+        self.image_token = "<|imgpad|>"
+        self.video_token = "<|video_pad|>"
+        self.img_token = "<|img|>"
+        self.endofimg_token = "<|endofimg|>"
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
     def __call__(
         self,
-        images: Optional[ImageInput] = None,
-        text: Optional[
-            Union[
-                TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]
-            ]
-        ] = None,
+        images: ImageInput | None = None,
+        text: TextInput | PreTokenizedInput | list[TextInput] | None = None,
         **kwargs: Unpack[DotsOCRProcessorKwargs],
     ) -> BatchFeature:
-        """
-        Main method to prepare for the model one or several sequences(s) and image(s). This method forwards the `text`
-        and `kwargs` arguments to LlamaTokenizerFast's [`~LlamaTokenizerFast.__call__`] if `text` is not `None` to encode
-        the text. To prepare the vision inputs, this method forwards the `images` and `kwargs` arguments to
-        Qwen2VLImageProcessor's [`~Qwen2VLImageProcessor.__call__`] if `images` is not `None`.
-
-        Args:
-            images (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, `List[PIL.Image.Image]`, `List[np.ndarray]`, `List[torch.Tensor]`):
-                The image or batch of images to be prepared. Each image can be a PIL image, NumPy array or PyTorch
-                tensor. Both channels-first and channels-last formats are supported.
-            text (`str`, `List[str]`, `List[List[str]]`):
-                The sequence or batch of sequences to be encoded. Each sequence can be a string or a list of strings
-                (pretokenized string). If the sequences are provided as list of strings (pretokenized), you must set
-                `is_split_into_words=True` (to lift the ambiguity with a batch of sequences).
-            return_tensors (`str` or [`~utils.TensorType`], *optional*):
-                If set, will return tensors of a particular framework. Acceptable values are:
-                - `'tf'`: Return TensorFlow `tf.constant` objects.
-                - `'pt'`: Return PyTorch `torch.Tensor` objects.
-                - `'np'`: Return NumPy `np.ndarray` objects.
-                - `'jax'`: Return JAX `jnp.ndarray` objects.
-
-        Returns:
-            [`BatchFeature`]: A [`BatchFeature`] with the following fields:
-
-            - **input_ids** -- List of token ids to be fed to a model. Returned when `text` is not `None`.
-            - **attention_mask** -- List of indices specifying which tokens should be attended to by the model (when
-              `return_attention_mask=True` or if *"attention_mask"* is in `self.model_input_names` and if `text` is not
-              `None`).
-            - **pixel_values** -- Pixel values to be fed to a model. Returned when `images` is not `None`.
-            - **image_grid_thw** -- List of image 3D grid in LLM. Returned when `images` is not `None`.
-        """
         output_kwargs = self._merge_kwargs(
-            DotsOCRProcessorKwargs,
-            tokenizer_init_kwargs=getattr(self.tokenizer, "init_kwargs", {}),
+            DotsOCRProcessorKwargs,  # type: ignore
+            tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
-
         if images is not None:
-            image_inputs = self.image_processor(
-                images=images, videos=None, **output_kwargs.get("images_kwargs", {})
-            )
+            image_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
             image_grid_thw = image_inputs["image_grid_thw"]
         else:
             image_inputs = {}
             image_grid_thw = None
 
-        if text is not None and not isinstance(text, list):
+        if not isinstance(text, list) and text is not None:
             text = [text]
 
         if image_grid_thw is not None and text is not None:
@@ -189,74 +140,15 @@ class DotsOCRProcessor(ProcessorMixin):
             for i in range(len(text)):
                 while self.image_token in text[i]:
                     text[i] = text[i].replace(
-                        self.image_token,
-                        "<|placeholder|>"
-                        * (image_grid_thw[index].prod() // merge_length),
-                        1,
+                        self.image_token, "<|placeholder|>" * (image_grid_thw[index].prod() // merge_length), 1
                     )
                     index += 1
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
-        if text is not None:
-            text_inputs = self.tokenizer(text, **output_kwargs.get("text_kwargs", {}))
-        else:
-            text_inputs = {}
+        _ = output_kwargs["text_kwargs"].pop("padding_side", None)
+        text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
 
         return BatchFeature(data={**text_inputs, **image_inputs})
-
-    def batch_decode(self, *args, **kwargs):
-        """
-        This method forwards all its arguments to LlamaTokenizerFast's [`~PreTrainedTokenizer.batch_decode`]. Please
-        refer to the docstring of this method for more information.
-        """
-        return self.tokenizer.batch_decode(*args, **kwargs)
-
-    def decode(self, *args, **kwargs):
-        """
-        This method forwards all its arguments to LlamaTokenizerFast's [`~PreTrainedTokenizer.decode`]. Please refer to
-        the docstring of this method for more information.
-        """
-        return self.tokenizer.decode(*args, **kwargs)
-
-    def post_process_image_text_to_text(
-        self,
-        generated_outputs,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-        **kwargs,
-    ):
-        """
-        Post-process the output of the model to decode the text.
-
-        Args:
-            generated_outputs (`torch.Tensor` or `np.ndarray`):
-                The output of the model `generate` function. The output is expected to be a tensor of shape `(batch_size, sequence_length)`
-                or `(sequence_length,)`.
-            skip_special_tokens (`bool`, *optional*, defaults to `True`):
-                Whether or not to remove special tokens in the output. Argument passed to the tokenizer's `batch_decode` method.
-            Clean_up_tokenization_spaces (`bool`, *optional*, defaults to `False`):
-                Whether or not to clean up the tokenization spaces. Argument passed to the tokenizer's `batch_decode` method.
-            **kwargs:
-                Additional arguments to be passed to the tokenizer's `batch_decode method`.
-
-        Returns:
-            `List[str]`: The decoded text.
-        """
-        return self.tokenizer.batch_decode(
-            generated_outputs,
-            skip_special_tokens=skip_special_tokens,
-            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
-            **kwargs,
-        )
-
-    @property
-    def model_input_names(self):
-        tokenizer_input_names = self.tokenizer.model_input_names
-        image_processor_input_names = self.image_processor.model_input_names
-        names_from_processor = list(
-            dict.fromkeys(tokenizer_input_names + image_processor_input_names)
-        )
-        return names_from_processor
 
 
 AutoProcessor.register(DotsOCRConfig, DotsOCRProcessor)
