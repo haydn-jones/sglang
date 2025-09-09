@@ -16,13 +16,23 @@ from sglang.srt.layers.linear import (
 from torch.nn import LayerNorm
 from transformers.modeling_utils import PreTrainedModel
 
+FLASH_ATTN_VER = 4
+
+flash_attn_varlen_func_v2 = None
+flash_attn_varlen_func_v4 = None
+flash_attn_available = False
+
 try:
-    from flash_attn import flash_attn_varlen_func  # pyright: ignore[reportMissingImports]
+    if FLASH_ATTN_VER == 2:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v2
+    elif FLASH_ATTN_VER == 4:
+        from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
+    else:
+        raise ImportError("Unsupported FLASH_ATTN_VER")
 
     flash_attn_available = True
 except ImportError:
-    flash_attn_varlen_func = None
-    flash_attn_available = False
+    pass
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -207,7 +217,11 @@ class DotsVisionBlock(nn.Module):
 class DotsVisionBlock2(nn.Module):
     def __init__(self, config: DotsOCRVisionConfig) -> None:
         super().__init__()
-        self.attn = FlashAttn(config, config.embed_dim, config.num_attention_heads, bias=config.use_bias)
+        if FLASH_ATTN_VER == 2:
+            self.attn = FlashAttn2(config, config.embed_dim, config.num_attention_heads, bias=config.use_bias)
+        elif FLASH_ATTN_VER == 4:
+            self.attn = FlashAttn4(config, config.embed_dim, config.num_attention_heads, bias=config.use_bias)
+
         self.norm1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
         self.mlp = DotsSwiGLUFFN(config)
         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
@@ -230,7 +244,7 @@ class DotsVisionBlock2(nn.Module):
         return hidden_states
 
 
-class FlashAttn(nn.Module):
+class FlashAttn2(nn.Module):
     def __init__(self, config: DotsOCRVisionConfig, dim: int, num_heads: int = 16, bias: bool = True) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -247,6 +261,7 @@ class FlashAttn(nn.Module):
         max_seqlen: int,
     ) -> torch.Tensor:
         assert flash_attn_available, "flash attention is not available"
+        assert FLASH_ATTN_VER == 2, "flash attention version mismatch"
 
         seq_length = hidden_states.shape[0]
         q, k, v = (
@@ -254,7 +269,7 @@ class FlashAttn(nn.Module):
         )  # 'shd'
 
         q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
-        attn_output = flash_attn_varlen_func(
+        attn_output = flash_attn_varlen_func_v2(
             q,
             k,
             v,
@@ -264,6 +279,44 @@ class FlashAttn(nn.Module):
             max_seqlen,
             causal=self.is_causal,
         ).reshape(seq_length, -1)  # type: ignore
+        attn_output = self.proj(attn_output)[0]
+
+        return attn_output
+
+
+class FlashAttn4(nn.Module):
+    def __init__(self, config: DotsOCRVisionConfig, dim: int, num_heads: int = 16, bias: bool = True) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.qkv_proj = ColumnParallelLinear(dim, dim * 3, bias=bias)
+        self.proj = RowParallelLinear(dim, dim, bias=bias)
+        self.config = config
+        self.is_causal = config.is_causal
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        assert flash_attn_available, "flash attention is not available"
+        assert FLASH_ATTN_VER == 4, "flash attention version mismatch"
+
+        seq_length = hidden_states.shape[0]
+        q, k, v = (
+            self.qkv_proj(hidden_states)[0].reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        )  # 'shd'
+
+        q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
+        attn_output = flash_attn_varlen_func_v4(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            causal=self.is_causal,
+        )[0].reshape(seq_length, -1)  # type: ignore
         attn_output = self.proj(attn_output)[0]
 
         return attn_output

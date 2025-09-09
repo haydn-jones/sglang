@@ -9,8 +9,6 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
-from torch import nn
-
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -22,6 +20,7 @@ from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
+from torch import nn
 
 _is_npu = is_npu()
 
@@ -51,11 +50,8 @@ class TransportProxyTensor(torch.Tensor):
         *args,
         **kwargs,
     ):
-
         if not isinstance(data, torch.Tensor):
-            raise TypeError(
-                f"Input 'data' must be a torch.Tensor, but got {type(data)}"
-            )
+            raise TypeError(f"Input 'data' must be a torch.Tensor, but got {type(data)}")
 
         instance = data.as_subclass(cls)
 
@@ -125,9 +121,9 @@ class TransportProxyTensor(torch.Tensor):
                 target_device = torch.device(f"cuda:{source_device_index}")
                 with torch.cuda.device(target_device):
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                    reconstructed_tensor = torch.empty(
-                        0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=0, size=shape, stride=stride)
+                    reconstructed_tensor = torch.empty(0, dtype=dtype, device=target_device).set_(
+                        storage, storage_offset=0, size=shape, stride=stride
+                    )
                     self.set_(reconstructed_tensor)
             except Exception as e:
                 print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
@@ -136,9 +132,7 @@ class TransportProxyTensor(torch.Tensor):
         elif state["tensor_data"] is not None:
             self.set_(state["tensor_data"])
         else:
-            raise pickle.UnpicklingError(
-                "Invalid state for TransportProxyTensor: no tensor data found."
-            )
+            raise pickle.UnpicklingError("Invalid state for TransportProxyTensor: no tensor data found.")
 
     @property
     def name(self) -> Optional[str]:
@@ -161,9 +155,7 @@ class MultiModalityDataPaddingPattern:
     """
 
     @abstractmethod
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: List[int], mm_inputs: MultimodalInputs) -> List[int]:
         """
         Pad the input ids sequence containing data tokens, and replace them with pad_values
         """
@@ -190,13 +182,9 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             See Minicpmo's slice_start_id for example
         """
         self.data_token_id_pairs = data_token_pairs
-        self.data_start_token_ids = data_start_token_ids or [
-            s for s, _e in data_token_pairs
-        ]
+        self.data_start_token_ids = data_start_token_ids or [s for s, _e in data_token_pairs]
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: List[int], mm_inputs: MultimodalInputs) -> List[int]:
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
@@ -206,9 +194,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         if data_token_pairs is None:
             data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
         if data_token_pairs is None:
-            print_warning_once(
-                "No data_token_pairs provided, RadixAttention might be influenced."
-            )
+            print_warning_once("No data_token_pairs provided, RadixAttention might be influenced.")
             return input_ids
         start_token_ids = {s for s, _e in data_token_pairs}
         end_tokens_ids = {e for _s, e in data_token_pairs}
@@ -250,9 +236,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: List[int], mm_inputs: MultimodalInputs) -> List[int]:
         """
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
@@ -353,9 +337,7 @@ def _get_precomputed_embedding(
     precomputed_embeddings = [item.precomputed_embeddings for item in items]
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
-            raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
-            )
+            raise NotImplementedError("MM inputs where only some items are precomputed.")
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -363,7 +345,207 @@ def _get_precomputed_embedding(
     return None
 
 
+def _calculate_expected_embedding_length(items: List[MultimodalDataItem]) -> int:
+    """Calculate the expected total embedding length for a list of multimodal items."""
+    return sum(sum(end - start + 1 for start, end in item.offsets) for item in items)
+
+
+def _should_skip_request(items_offset: List[Tuple[int, int]], prefix_length: int) -> bool:
+    """Check if all items have been prefixed and we should skip this request."""
+    return all(offset_end < prefix_length for _, offset_end in items_offset)
+
+
+def _batch_compute_embeddings(
+    requests_to_compute: List[dict],
+    expected_lengths: dict,
+    data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
+    max_batch_size: int | None = None,
+) -> dict:
+    """Batch compute embeddings for all requests that need computation, chunking into smaller batches."""
+    if not requests_to_compute:
+        return {}
+
+    if max_batch_size is None:
+        max_batch_size = DEFAULT_MM_CPF_MAX_BATCH_SIZE
+
+    computed_embeddings = {}
+
+    # Process requests in chunks of max_batch_size
+    for chunk_start in range(0, len(requests_to_compute), max_batch_size):
+        chunk_end = min(chunk_start + max_batch_size, len(requests_to_compute))
+        batch_requests = requests_to_compute[chunk_start:chunk_end]
+
+        # Collect items and expected lengths for this batch
+        batch_items = []
+        batch_expected_lengths = []
+
+        for req_info in batch_requests:
+            req_index = req_info["index"]
+            items = req_info["items"]
+            batch_items.extend(items)
+
+            # Get or compute expected length
+            if req_index in expected_lengths:
+                batch_expected_lengths.append(expected_lengths[req_index])
+            else:
+                batch_expected_lengths.append(_calculate_expected_embedding_length(items))
+
+        if not batch_items:
+            continue
+
+        # Batch encode items for this chunk
+        batch_embeddings = data_embedding_func(batch_items)  # Shape: [total_tokens, D]
+
+        # Slice out individual request embeddings
+        start_idx = 0
+
+        for i, req_info in enumerate(batch_requests):
+            expected_length = batch_expected_lengths[i]
+            end_idx = start_idx + expected_length
+
+            # Extract this request's embedding from the batch
+            embedding_per_req = batch_embeddings[start_idx:end_idx]
+
+            # Verify the sliced embedding shape
+            req_index = req_info["index"]
+            actual_length = embedding_per_req.shape[0]
+            if actual_length != expected_length:
+                logger.warning(
+                    f"Batch compute (chunk {chunk_start // max_batch_size + 1}): "
+                    f"Embedding length mismatch for request {req_index}: "
+                    f"expected {expected_length} tokens, got {actual_length} tokens"
+                )
+            else:
+                logger.debug(
+                    f"Batch compute (chunk {chunk_start // max_batch_size + 1}): "
+                    f"Embedding length verified for request {req_index}: {actual_length} tokens"
+                )
+
+            # Cache the individual embedding
+            if not embedding_cache.put(req_info["hash"], embedding_per_req):
+                print_warning_once(
+                    "Multimodal embedding cache is full. This typically occurs when a single "
+                    "embedding exceeds the cache size limit. Consider increasing the "
+                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+                    "embedding size."
+                )
+
+            # Store for later use
+            computed_embeddings[req_index] = embedding_per_req
+
+            # Move to next slice
+            start_idx = end_idx
+
+    return computed_embeddings
+
+
+DEFAULT_MM_CPF_DO_BATCH = True
+DEFAULT_MM_CPF_MAX_BATCH_SIZE = 16  # Maximum number of requests to process in a single batch
+
+
 def _get_chunked_prefill_embedding(
+    data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
+    embedding_items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    batch: bool | None = None,
+) -> Optional[torch.Tensor]:
+    if (batch is None and not DEFAULT_MM_CPF_DO_BATCH) or batch is False:
+        return _get_chunked_prefill_embedding_serial(
+            data_embedding_func,
+            embedding_items,
+            items_size,
+            prefix_length,
+            extend_length,
+            items_offset_list,
+        )
+    else:
+        return _get_chunked_prefill_embedding_batch(
+            data_embedding_func,
+            embedding_items,
+            items_size,
+            prefix_length,
+            extend_length,
+            items_offset_list,
+        )
+
+
+def _get_chunked_prefill_embedding_batch(
+    data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
+    embedding_items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+) -> Optional[torch.Tensor]:
+    """Calculate embeddings for each request, using cache when available and batching new computations."""
+    # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+
+    # Collect request information and check cache in a single pass
+    requests_to_compute = []
+    cached_embeddings = {}
+    expected_lengths = {}
+    valid_requests = []  # Track which requests we'll need chunks from
+
+    for i in range(max_iterations):
+        # Skip empty requests
+        if items_size[i] == items_size[i + 1]:
+            continue
+
+        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        items_offset = items_offset_list[i]
+        assert items_offset is not None, items_offset
+
+        # Skip if all items have been prefixed
+        if _should_skip_request(items_offset, prefix_length[i]):
+            continue
+
+        valid_requests.append(i)
+
+        # Calculate expected embedding length
+        expected_lengths[i] = _calculate_expected_embedding_length(embedding_items_per_req)
+
+        # Check cache
+        embedding_items_hash = get_embedding_hash(embedding_items_per_req)
+        embedding_per_req = embedding_cache.get(embedding_items_hash)
+
+        if embedding_per_req is None:
+            requests_to_compute.append(
+                {"index": i, "items": embedding_items_per_req, "hash": embedding_items_hash, "offset": items_offset}
+            )
+        else:
+            cached_embeddings[i] = embedding_per_req
+
+    # Batch compute all missing embeddings
+    computed_embeddings = _batch_compute_embeddings(requests_to_compute, expected_lengths, data_embedding_func)
+
+    # Extract chunks for all valid requests
+    embedding_list = []
+    for i in valid_requests:
+        # Get embedding from cache or computed results
+        embedding_per_req = cached_embeddings.get(i) or computed_embeddings.get(i)
+        if embedding_per_req is None:
+            continue
+
+        # Extract the chunk we need for this forward pass
+        embedding_per_req_chunk, _, _ = get_embedding_chunk(
+            embedding=embedding_per_req,
+            extend_prefix_len=prefix_length[i],
+            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
+            items_offset=items_offset_list[i],
+        )
+        embedding_list.append(embedding_per_req_chunk)
+
+    # Return concatenated embeddings or None if empty
+    if not embedding_list:
+        return None
+    return torch.concat(embedding_list, dim=0)
+
+
+def _get_chunked_prefill_embedding_serial(
     data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
     embedding_items: List[MultimodalDataItem],
     items_size: List[int],
@@ -408,9 +590,7 @@ def _get_chunked_prefill_embedding(
     return torch.concat(embedding_list, dim=0)
 
 
-def _get_multimodal_mask(
-    input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
-) -> torch.Tensor:
+def _get_multimodal_mask(input_ids: torch.Tensor, placeholder_tensor: torch.Tensor) -> torch.Tensor:
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
@@ -503,9 +683,7 @@ def embed_mm_inputs(
     input_ids: torch.Tensor,
     input_embedding: nn.Embedding,
     multimodal_model: nn.Module = None,
-    data_embedding_func_mapping: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
+    data_embedding_func_mapping: Dict[Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
 ) -> Optional[torch.Tensor]:
     """
@@ -536,14 +714,8 @@ def embed_mm_inputs(
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
     for modality in Modality.all():
-        items = [
-            item for item in item_flatten_list if item.is_modality(modality=modality)
-        ]
-        embedder = (
-            None
-            if data_embedding_func_mapping is None
-            else data_embedding_func_mapping.get(modality, None)
-        )
+        items = [item for item in item_flatten_list if item.is_modality(modality=modality)]
+        embedder = None if data_embedding_func_mapping is None else data_embedding_func_mapping.get(modality, None)
         if embedder is None:
             # "image", "video", etc
             modality_id = modality.name.lower()
@@ -557,15 +729,9 @@ def embed_mm_inputs(
             items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
             items_offsets = []
             for i, mm_inputs in enumerate(mm_inputs_list):
-                mm_items = [
-                    item
-                    for item in mm_inputs.mm_items
-                    if item.is_modality(modality=modality)
-                ]
+                mm_items = [item for item in mm_inputs.mm_items if item.is_modality(modality=modality)]
                 items_size[i + 1] = len(mm_items)
-                items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_items])
-                )
+                items_offsets.append(flatten_nested_list([item.offsets for item in mm_items]))
             items_size = torch.cumsum(items_size, dim=0).tolist()
 
             embedding, mask = get_embedding_and_mask(
@@ -605,9 +771,7 @@ def general_mm_embed_routine(
     forward_batch: ForwardBatch,
     language_model: nn.Module,
     multimodal_model: Optional[nn.Module] = None,
-    data_embedding_funcs: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
+    data_embedding_funcs: Dict[Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     **kwargs,
 ) -> torch.Tensor:
@@ -632,9 +796,7 @@ def general_mm_embed_routine(
         and not forward_batch.forward_mode.is_target_verify()
         and forward_batch.contains_mm_inputs()
     ):
-        mm_inputs_list = [
-            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-        ]
+        mm_inputs_list = [mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None]
         extend_prefix_lens = [
             prefix_len
             for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
@@ -686,12 +848,8 @@ def get_multimodal_data_bounds(
     assert all(isinstance(t, int) for t in start_tokens)
     assert all(isinstance(t, int) for t in end_tokens)
 
-    start_cond = torch.isin(
-        input_ids, torch.as_tensor(start_tokens, device=input_ids.device)
-    )
-    end_cond = torch.isin(
-        input_ids, torch.as_tensor(end_tokens, device=input_ids.device)
-    )
+    start_cond = torch.isin(input_ids, torch.as_tensor(start_tokens, device=input_ids.device))
+    end_cond = torch.isin(input_ids, torch.as_tensor(end_tokens, device=input_ids.device))
 
     (data_start_tokens,) = torch.where(start_cond)
     (data_end_tokens,) = torch.where(end_cond)
@@ -742,9 +900,7 @@ def tensor_hash(tensor_list) -> int:
     tensor = tensor_list
     if isinstance(tensor_list, list):
         tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
+        tensor_list = [x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list]
         tensor = torch.concat(tensor_list)
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
