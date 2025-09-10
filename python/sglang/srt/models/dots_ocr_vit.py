@@ -24,8 +24,10 @@ flash_attn_available = False
 
 try:
     if FLASH_ATTN_VER == 2:
+        print("Using FA2")
         from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v2
     elif FLASH_ATTN_VER == 4:
+        print("Using FA4")
         from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
     else:
         raise ImportError("Unsupported FLASH_ATTN_VER")
@@ -309,6 +311,15 @@ class FlashAttn4(nn.Module):
         )  # 'shd'
 
         q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
+        attn_output = self.attn_forward(q, k, v, cu_seqlens, seq_length)
+        attn_output = self.proj(attn_output)[0]
+
+        return attn_output
+
+    @torch.compiler.disable
+    def attn_forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor, seq_length: int
+    ) -> torch.Tensor:
         attn_output = flash_attn_varlen_func_v4(
             q,
             k,
@@ -317,8 +328,6 @@ class FlashAttn4(nn.Module):
             cu_seqlens,
             causal=self.is_causal,
         )[0].reshape(seq_length, -1)  # type: ignore
-        attn_output = self.proj(attn_output)[0]
-
         return attn_output
 
 
@@ -437,9 +446,10 @@ class DotsVisionTransformer(PreTrainedModel):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        grid_thw: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
+        position_embeddings = self.rot_pos_emb(grid_thw)
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
@@ -455,6 +465,7 @@ class DotsVisionTransformer(PreTrainedModel):
         return hidden_states
 
     @torch.inference_mode()
+    @torch.compile
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         hidden_states = self.patch_embed(hidden_states)
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
@@ -463,5 +474,4 @@ class DotsVisionTransformer(PreTrainedModel):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0).to(hidden_states.device)
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-        position_embeddings = self.rot_pos_emb(grid_thw)
-        return self._blk_forward(hidden_states, cu_seqlens, position_embeddings, max_seqlen)  # type: ignore
+        return self._blk_forward(hidden_states, cu_seqlens, grid_thw, max_seqlen)  # type: ignore
